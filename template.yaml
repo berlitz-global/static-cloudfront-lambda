@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Resources for hosting a static website on
+  Amazon S3, CloudFront & Lambda@Edge for URI
+  rewriting.
+
+###############################################################################
+Parameters:
+  ###############################################################################
+
+  AcmCertificateArn:
+    Type: String
+    Description: >
+      The ARN of the SSL certificate to use for the CloudFront distribution.
+
+  DomainName:
+    Type: String
+    Description: The website domain name.
+    Default: lroguet.example
+
+  PriceClass:
+    Type: String
+    Description: The CloudFront distribution price class
+    Default: "PriceClass_All"
+    AllowedValues:
+      - "PriceClass_100"
+      - "PriceClass_200"
+      - "PriceClass_All"
+
+  WhitelistedExtensions:
+    Type: String
+    Description: >
+      A comma delimited list of File extensions that are expected in a URL and
+      for which URL rewriting to a default index object should not be performed.
+    Default: "css,html,ico,jpg,jpeg,js,png,ttf,txt,xml"
+
+###############################################################################
+Resources:
+  ###############################################################################
+
+  TheCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Ref DomainName
+        DefaultCacheBehavior:
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+          TargetOriginId: the-s3-bucket
+          ViewerProtocolPolicy: redirect-to-https
+          LambdaFunctionAssociations:
+            - EventType: origin-request
+              LambdaFunctionARN: !Ref TheOriginRequestLambdaFunctionVersion
+        DefaultRootObject: index.html
+        CustomErrorResponses:
+          - ErrorCachingMinTTL: 300
+            ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+        Enabled: true
+        HttpVersion: http2
+        Origins:
+          - DomainName: !Join ["", [!Ref TheBucket, ".s3.amazonaws.com"]]
+            Id: the-s3-bucket
+            S3OriginConfig:
+              OriginAccessIdentity:
+                !Join [
+                  "",
+                  [
+                    "origin-access-identity/cloudfront/",
+                    !Ref TheCloudFrontOriginAccessIdentity,
+                  ],
+                ]
+        PriceClass: !Ref PriceClass
+        ViewerCertificate:
+          AcmCertificateArn: !Ref AcmCertificateArn
+          MinimumProtocolVersion: TLSv1.1_2016
+          SslSupportMethod: sni-only
+      Tags:
+        - Key: Domain
+          Value: !Ref DomainName
+
+  TheCloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "CloudFront OAI for ${DomainName}"
+
+  TheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Domain
+          Value: !Ref DomainName
+
+  TheBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TheBucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource: !Join ["", ["arn:aws:s3:::", !Ref TheBucket, "/*"]]
+            Principal:
+              CanonicalUser: !GetAtt TheCloudFrontOriginAccessIdentity.S3CanonicalUserId
+
+  TheOriginRequestLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: >
+        Lambda function performing request URI rewriting.
+      Code:
+        ZipFile: !Sub |
+          'use strict';
+          const AWS = require('aws-sdk');
+          const SSM = new AWS.SSM({region: '${AWS::Region}'});
+          exports.handler = (event, context, callback) => {
+            var params = {
+              Name: '${TheOriginRequestParameter}',
+              WithDecryption: false
+            };
+            SSM.getParameter(params, function(error, data) {
+              var whitelist = ['css', 'html', 'jpg', 'jpeg', 'png', 'txt', 'xml'];
+              if (data) {
+                whitelist = data.Parameter.Value.split(',');
+              }
+              // Original request
+              var request = event.Records[0].cf.request;
+              // Figure out if the uri is for a file with extension
+              var extension = request.uri.split('.').pop();
+              // '/posts'.split('.').pop() returns '/posts'
+              if (typeof extension == 'undefined' || !whitelist.includes(extension)) {
+                // Add default index to URI
+                request.uri = request.uri.replace(/\/?$/, '\/index.html');
+              }
+              // Return request to CloudFront
+              return callback(null, request);
+            });
+          };
+      Handler: index.handler
+      MemorySize: 128
+      Role: !Sub ${TheOriginRequestLambdaFunctionExecutionRole.Arn}
+      Runtime: nodejs6.10
+      Tags:
+        - Key: Domain
+          Value: !Ref DomainName
+
+  TheOriginRequestLambdaFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref TheOriginRequestLambdaFunction
+      Description: !Sub "URL rewriting for ${DomainName}"
+
+  TheOriginRequestLambdaFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - edgelambda.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: "ParameterStoreAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:GetParameter*"
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${TheOriginRequestParameter}"
+
+  TheOriginRequestParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: !Sub "Whitelist for ${DomainName}"
+      Type: StringList
+      Value: !Ref WhitelistedExtensions
